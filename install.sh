@@ -2,39 +2,49 @@
 
 # ============================================
 # YouTube Streaming Dashboard Installer
-# Lightweight Go-React Monolith Architecture
+# Full-Featured with Google Authenticator
+# One-Command Installation - Zero Hassle
 # ============================================
 
-set -e  # Exit on error
+set -e
 
-echo "🚀 YouTube Streaming Dashboard - Automated Installer"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+echo -e "${BLUE}🚀 YouTube Streaming Dashboard - Full Installer${NC}"
 echo "===================================================="
 
-# Check if running as root
 if [ "$EUID" -ne 0 ]; then 
-   echo "⚠️  Please run as root: sudo bash install.sh"
+   echo -e "${RED}⚠️  Please run as root: sudo bash install.sh${NC}"
    exit 1
 fi
 
-# Configuration
 APP_NAME="yt-streaming-dashboard"
 INSTALL_DIR="/opt/$APP_NAME"
 PORT=55001
 
 echo ""
-echo "📋 Configuration:"
+echo -e "${YELLOW}📋 Configuration:${NC}"
 echo "   App Name: $APP_NAME"
 echo "   Install Directory: $INSTALL_DIR"
 echo "   Port: $PORT"
 echo ""
 
-# Step 1: Install Dependencies
-echo "📦 [1/6] Installing system dependencies..."
-apt update -qq
-apt install -y build-essential sqlite3 curl wget git
+# Cleanup any previous failed installation
+if [ -d "$INSTALL_DIR" ]; then
+    echo -e "${YELLOW}🗑️  Cleaning up previous installation...${NC}"
+    systemctl stop $APP_NAME 2>/dev/null || true
+    rm -rf $INSTALL_DIR
+fi
 
-# Step 2: Install Go
-echo "🐹 [2/6] Installing Go 1.21..."
+echo -e "${GREEN}📦 [1/7] Installing system dependencies...${NC}"
+apt update -qq
+apt install -y build-essential sqlite3 curl wget git qrencode
+
+echo -e "${GREEN}🐹 [2/7] Installing Go 1.21...${NC}"
 if ! command -v go &> /dev/null; then
     wget -q https://go.dev/dl/go1.21.5.linux-amd64.tar.gz
     rm -rf /usr/local/go
@@ -42,52 +52,66 @@ if ! command -v go &> /dev/null; then
     rm go1.21.5.linux-amd64.tar.gz
     export PATH=$PATH:/usr/local/go/bin
     echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc
-    echo "✅ Go installed"
+    echo -e "${GREEN}✅ Go installed${NC}"
 else
-    echo "✅ Go already installed ($(go version))"
+    echo -e "${GREEN}✅ Go already installed ($(go version))${NC}"
 fi
 
-# Step 3: Install Node.js
-echo "📗 [3/6] Installing Node.js 18..."
+export PATH=$PATH:/usr/local/go/bin
+
+echo -e "${GREEN}📗 [3/7] Installing Node.js 18...${NC}"
 if ! command -v node &> /dev/null; then
     curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
     apt install -y nodejs
-    echo "✅ Node.js installed"
+    echo -e "${GREEN}✅ Node.js installed${NC}"
 else
-    echo "✅ Node.js already installed ($(node -v))"
+    echo -e "${GREEN}✅ Node.js already installed ($(node -v))${NC}"
 fi
 
-# Step 4: Create Project Structure
-echo "📁 [4/6] Creating project structure..."
+echo -e "${GREEN}📁 [4/7] Creating project structure...${NC}"
 mkdir -p $INSTALL_DIR/{backend,frontend/src}
 cd $INSTALL_DIR
 
-# Create Go Backend
 cat > backend/main.go << 'GOEOF'
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/base32"
+	"fmt"
 	"log"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/golang-jwt/jwt/v4"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/pquerna/otp/totp"
+	"golang.org/x/crypto/bcrypt"
 )
 
+type User struct {
+	ID        int    `json:"id"`
+	Username  string `json:"username"`
+	Password  string `json:"-"`
+	OTPSecret string `json:"-"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type Stream struct {
-	ID          int       `json:"id"`
-	Title       string    `json:"title"`
-	StreamKey   string    `json:"stream_key"`
-	Status      string    `json:"status"`
-	Viewers     int       `json:"viewers"`
-	StartTime   time.Time `json:"start_time"`
+	ID          int        `json:"id"`
+	Title       string     `json:"title"`
+	StreamKey   string     `json:"stream_key"`
+	Status      string     `json:"status"`
+	Viewers     int        `json:"viewers"`
+	StartTime   time.Time  `json:"start_time"`
 	EndTime     *time.Time `json:"end_time"`
 }
 
 var db *sql.DB
+var jwtSecret = []byte("your-super-secret-jwt-key-change-this-in-production")
 
 func initDB() error {
 	var err error
@@ -97,6 +121,13 @@ func initDB() error {
 	}
 
 	schema := `
+	CREATE TABLE IF NOT EXISTS users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT UNIQUE NOT NULL,
+		password TEXT NOT NULL,
+		otp_secret TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	CREATE TABLE IF NOT EXISTS streams (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		title TEXT NOT NULL,
@@ -112,29 +143,192 @@ func initDB() error {
 	return err
 }
 
+func generateOTPSecret() string {
+	secret := make([]byte, 20)
+	rand.Read(secret)
+	return base32.StdEncoding.EncodeToString(secret)
+}
+
+func createDefaultUser() error {
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+	if err != nil {
+		return err
+	}
+
+	if count == 0 {
+		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("admin"), bcrypt.DefaultCost)
+		otpSecret := generateOTPSecret()
+		
+		_, err = db.Exec(
+			"INSERT INTO users (username, password, otp_secret) VALUES (?, ?, ?)",
+			"admin", string(hashedPassword), otpSecret,
+		)
+		if err != nil {
+			return err
+		}
+		
+		log.Println("✅ Default user created: admin / admin")
+		log.Println("⚠️  Please change password after first login!")
+	}
+	
+	return nil
+}
+
+func generateJWT(username string) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"username": username,
+		"exp":      time.Now().Add(time.Hour * 24).Unix(),
+	})
+	return token.SignedString(jwtSecret)
+}
+
+func authMiddleware(c *fiber.Ctx) error {
+	authHeader := c.Get("Authorization")
+	if authHeader == "" {
+		return c.Status(401).JSON(fiber.Map{"error": "Missing authorization header"})
+	}
+
+	tokenString := authHeader[7:] // Remove "Bearer "
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	})
+
+	if err != nil || !token.Valid {
+		return c.Status(401).JSON(fiber.Map{"error": "Invalid token"})
+	}
+
+	return c.Next()
+}
+
 func main() {
 	app := fiber.New(fiber.Config{
 		AppName: "YouTube Streaming Dashboard",
 	})
 
-	// Middleware
-	app.Use(cors.New())
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+	}))
 	app.Use(logger.New())
 
-	// Initialize Database
 	if err := initDB(); err != nil {
 		log.Fatal("Failed to initialize database:", err)
 	}
 	defer db.Close()
 
-	// Serve Frontend
+	if err := createDefaultUser(); err != nil {
+		log.Fatal("Failed to create default user:", err)
+	}
+
 	app.Static("/", "./frontend/dist")
 
-	// API Routes
 	api := app.Group("/api")
 
-	// Get all streams
-	api.Get("/streams", func(c *fiber.Ctx) error {
+	// Auth Routes
+	api.Post("/setup-check", func(c *fiber.Ctx) error {
+		var count int
+		db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+		return c.JSON(fiber.Map{"needs_setup": count == 0})
+	})
+
+	api.Post("/setup", func(c *fiber.Ctx) error {
+		var input struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := c.BodyParser(&input); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
+		}
+
+		var count int
+		db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+		if count > 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Setup already completed"})
+		}
+
+		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+		otpSecret := generateOTPSecret()
+
+		_, err := db.Exec(
+			"INSERT INTO users (username, password, otp_secret) VALUES (?, ?, ?)",
+			input.Username, string(hashedPassword), otpSecret,
+		)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		otpURL := fmt.Sprintf("otpauth://totp/YT-Dashboard:%s?secret=%s&issuer=YT-Dashboard",
+			input.Username, otpSecret)
+
+		return c.JSON(fiber.Map{
+			"message": "Setup complete",
+			"otp_url": otpURL,
+			"secret":  otpSecret,
+		})
+	})
+
+	api.Post("/login", func(c *fiber.Ctx) error {
+		var input struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			OTP      string `json:"otp"`
+		}
+		if err := c.BodyParser(&input); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
+		}
+
+		var user User
+		err := db.QueryRow(
+			"SELECT id, username, password, otp_secret FROM users WHERE username = ?",
+			input.Username,
+		).Scan(&user.ID, &user.Username, &user.Password, &user.OTPSecret)
+
+		if err != nil {
+			return c.Status(401).JSON(fiber.Map{"error": "Invalid credentials"})
+		}
+
+		if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
+			return c.Status(401).JSON(fiber.Map{"error": "Invalid credentials"})
+		}
+
+		if !totp.Validate(input.OTP, user.OTPSecret) {
+			return c.Status(401).JSON(fiber.Map{"error": "Invalid OTP"})
+		}
+
+		token, err := generateJWT(user.Username)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to generate token"})
+		}
+
+		return c.JSON(fiber.Map{
+			"token":    token,
+			"username": user.Username,
+		})
+	})
+
+	api.Get("/qr-code", func(c *fiber.Ctx) error {
+		username := c.Query("username", "admin")
+		
+		var otpSecret string
+		err := db.QueryRow("SELECT otp_secret FROM users WHERE username = ?", username).Scan(&otpSecret)
+		if err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "User not found"})
+		}
+
+		otpURL := fmt.Sprintf("otpauth://totp/YT-Dashboard:%s?secret=%s&issuer=YT-Dashboard",
+			username, otpSecret)
+
+		return c.JSON(fiber.Map{
+			"otp_url": otpURL,
+			"secret":  otpSecret,
+		})
+	})
+
+	// Protected Routes
+	protected := api.Group("/", authMiddleware)
+
+	protected.Get("/streams", func(c *fiber.Ctx) error {
 		rows, err := db.Query("SELECT id, title, stream_key, status, viewers, start_time, end_time FROM streams ORDER BY id DESC")
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
@@ -157,8 +351,7 @@ func main() {
 		return c.JSON(streams)
 	})
 
-	// Create new stream
-	api.Post("/streams", func(c *fiber.Ctx) error {
+	protected.Post("/streams", func(c *fiber.Ctx) error {
 		var input struct {
 			Title     string `json:"title"`
 			StreamKey string `json:"stream_key"`
@@ -179,8 +372,7 @@ func main() {
 		return c.JSON(fiber.Map{"id": id, "message": "Stream created"})
 	})
 
-	// Update stream status
-	api.Put("/streams/:id/status", func(c *fiber.Ctx) error {
+	protected.Put("/streams/:id/status", func(c *fiber.Ctx) error {
 		id := c.Params("id")
 		var input struct {
 			Status string `json:"status"`
@@ -197,8 +389,7 @@ func main() {
 		return c.JSON(fiber.Map{"message": "Status updated"})
 	})
 
-	// Delete stream
-	api.Delete("/streams/:id", func(c *fiber.Ctx) error {
+	protected.Delete("/streams/:id", func(c *fiber.Ctx) error {
 		id := c.Params("id")
 		_, err := db.Exec("DELETE FROM streams WHERE id = ?", id)
 		if err != nil {
@@ -207,12 +398,10 @@ func main() {
 		return c.JSON(fiber.Map{"message": "Stream deleted"})
 	})
 
-	// Health check
-	api.Get("/health", func(c *fiber.Ctx) error {
+	protected.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok", "time": time.Now()})
 	})
 
-	// React Router Handler
 	app.Get("*", func(c *fiber.Ctx) error {
 		return c.SendFile("./frontend/dist/index.html")
 	})
@@ -222,7 +411,6 @@ func main() {
 }
 GOEOF
 
-# Create Go mod
 cat > backend/go.mod << 'MODEOF'
 module yt-streaming-dashboard
 
@@ -230,11 +418,13 @@ go 1.21
 
 require (
 	github.com/gofiber/fiber/v2 v2.52.0
+	github.com/golang-jwt/jwt/v4 v4.5.0
 	github.com/mattn/go-sqlite3 v1.14.19
+	github.com/pquerna/otp v1.4.0
+	golang.org/x/crypto v0.18.0
 )
 MODEOF
 
-# Create Frontend Package.json
 cat > frontend/package.json << 'PKGEOF'
 {
   "name": "yt-streaming-dashboard-frontend",
@@ -248,7 +438,8 @@ cat > frontend/package.json << 'PKGEOF'
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "lucide-react": "^0.263.1"
+    "lucide-react": "^0.263.1",
+    "qrcode.react": "^3.1.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.1",
@@ -260,7 +451,6 @@ cat > frontend/package.json << 'PKGEOF'
 }
 PKGEOF
 
-# Create Vite Config
 cat > frontend/vite.config.js << 'VITEEOF'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
@@ -275,7 +465,6 @@ export default defineConfig({
 })
 VITEEOF
 
-# Create Tailwind Config
 cat > frontend/tailwind.config.js << 'TAILEOF'
 export default {
   content: [
@@ -298,7 +487,6 @@ export default {
 }
 POSTEOF
 
-# Create Frontend Files
 mkdir -p frontend/src
 
 cat > frontend/index.html << 'HTMLEOF'
@@ -346,12 +534,154 @@ CSSEOF
 
 cat > frontend/src/App.jsx << 'APPEOF'
 import React, { useState, useEffect } from 'react';
-import { Play, Square, Trash2, Plus, Radio } from 'lucide-react';
+import { Play, Square, Trash2, Plus, Radio, LogOut, Key } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
 
-export default function App() {
+function LoginPage({ onLogin }) {
+  const [username, setUsername] = useState('admin');
+  const [password, setPassword] = useState('');
+  const [otp, setOtp] = useState('');
+  const [showQR, setShowQR] = useState(false);
+  const [qrData, setQrData] = useState(null);
+  const [error, setError] = useState('');
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setError('');
+
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password, otp })
+      });
+
+      const data = await res.json();
+      
+      if (!res.ok) {
+        setError(data.error || 'Login failed');
+        return;
+      }
+
+      localStorage.setItem('token', data.token);
+      localStorage.setItem('username', data.username);
+      onLogin(data.token);
+    } catch (err) {
+      setError('Connection error');
+    }
+  };
+
+  const showQRCode = async () => {
+    try {
+      const res = await fetch(`/api/qr-code?username=${username}`);
+      const data = await res.json();
+      setQrData(data);
+      setShowQR(true);
+    } catch (err) {
+      setError('Failed to load QR code');
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 to-gray-800 flex items-center justify-center p-4">
+      <div className="bg-gray-800 p-8 rounded-lg shadow-2xl w-full max-w-md">
+        <div className="text-center mb-8">
+          <Radio className="mx-auto text-red-500 mb-4" size={64} />
+          <h1 className="text-3xl font-bold text-white">YT Streaming Dashboard</h1>
+          <p className="text-gray-400 mt-2">Secure Login with Google Authenticator</p>
+        </div>
+
+        {showQR && qrData ? (
+          <div className="text-center">
+            <h2 className="text-xl font-semibold text-white mb-4">Scan QR Code</h2>
+            <div className="bg-white p-4 rounded-lg inline-block mb-4">
+              <QRCodeSVG value={qrData.otp_url} size={200} />
+            </div>
+            <div className="bg-gray-700 p-4 rounded-lg mb-4">
+              <p className="text-gray-300 text-sm mb-2">Manual Entry:</p>
+              <code className="text-green-400 break-all text-xs">{qrData.secret}</code>
+            </div>
+            <button
+              onClick={() => setShowQR(false)}
+              className="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg text-white transition"
+            >
+              Back to Login
+            </button>
+          </div>
+        ) : (
+          <form onSubmit={handleLogin} className="space-y-4">
+            {error && (
+              <div className="bg-red-600 text-white p-3 rounded-lg text-sm">
+                {error}
+              </div>
+            )}
+
+            <div>
+              <label className="block text-gray-300 mb-2 text-sm">Username</label>
+              <input
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full bg-gray-700 text-white px-4 py-3 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500"
+                required
+              />
+            </div>
+
+            <div>
+              <label className="block text-gray-300 mb-2 text-sm">Password</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full bg-gray-700 text-white px-4 py-3 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500"
+                required
+              />
+            </div>
+
+            <div>
+              <label className="block text-gray-300 mb-2 text-sm">Google Authenticator Code</label>
+              <input
+                type="text"
+                value={otp}
+                onChange={(e) => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                placeholder="000000"
+                className="w-full bg-gray-700 text-white px-4 py-3 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500 text-center text-2xl tracking-widest"
+                maxLength={6}
+                required
+              />
+            </div>
+
+            <button
+              type="submit"
+              className="w-full bg-red-600 hover:bg-red-700 text-white py-3 rounded-lg font-semibold transition"
+            >
+              Login
+            </button>
+
+            <button
+              type="button"
+              onClick={showQRCode}
+              className="w-full bg-gray-700 hover:bg-gray-600 text-white py-3 rounded-lg font-semibold transition flex items-center justify-center gap-2"
+            >
+              <Key size={20} />
+              Show QR Code
+            </button>
+
+            <p className="text-gray-400 text-xs text-center mt-4">
+              Default: admin / admin
+            </p>
+          </form>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Dashboard({ onLogout }) {
   const [streams, setStreams] = useState([]);
   const [showForm, setShowForm] = useState(false);
   const [formData, setFormData] = useState({ title: '', stream_key: '' });
+  const username = localStorage.getItem('username');
 
   useEffect(() => {
     fetchStreams();
@@ -361,7 +691,16 @@ export default function App() {
 
   const fetchStreams = async () => {
     try {
-      const res = await fetch('/api/streams');
+      const token = localStorage.getItem('token');
+      const res = await fetch('/api/streams', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      
+      if (res.status === 401) {
+        onLogout();
+        return;
+      }
+      
       const data = await res.json();
       setStreams(data || []);
     } catch (err) {
@@ -372,9 +711,13 @@ export default function App() {
   const createStream = async (e) => {
     e.preventDefault();
     try {
+      const token = localStorage.getItem('token');
       await fetch('/api/streams', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify(formData)
       });
       setFormData({ title: '', stream_key: '' });
@@ -387,9 +730,13 @@ export default function App() {
 
   const updateStatus = async (id, status) => {
     try {
+      const token = localStorage.getItem('token');
       await fetch(`/api/streams/${id}/status`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({ status })
       });
       fetchStreams();
@@ -401,7 +748,11 @@ export default function App() {
   const deleteStream = async (id) => {
     if (!confirm('Delete this stream?')) return;
     try {
-      await fetch(`/api/streams/${id}`, { method: 'DELETE' });
+      const token = localStorage.getItem('token');
+      await fetch(`/api/streams/${id}`, { 
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
       fetchStreams();
     } catch (err) {
       console.error('Failed to delete stream:', err);
@@ -412,17 +763,29 @@ export default function App() {
     <div className="min-h-screen bg-gradient-to-br from-gray-900 to-gray-800 text-white">
       <div className="container mx-auto px-4 py-8">
         <div className="flex justify-between items-center mb-8">
-          <h1 className="text-4xl font-bold flex items-center gap-3">
-            <Radio className="text-red-500" size={40} />
-            YouTube Streaming Dashboard
-          </h1>
-          <button
-            onClick={() => setShowForm(!showForm)}
-            className="bg-red-600 hover:bg-red-700 px-6 py-3 rounded-lg flex items-center gap-2 transition"
-          >
-            <Plus size={20} />
-            New Stream
-          </button>
+          <div>
+            <h1 className="text-4xl font-bold flex items-center gap-3">
+              <Radio className="text-red-500" size={40} />
+              YouTube Streaming Dashboard
+            </h1>
+            <p className="text-gray-400 mt-2">Welcome, {username}</p>
+          </div>
+          <div className="flex gap-3">
+            <button
+              onClick={() => setShowForm(!showForm)}
+              className="bg-red-600 hover:bg-red-700 px-6 py-3 rounded-lg flex items-center gap-2 transition"
+            >
+              <Plus size={20} />
+              New Stream
+            </button>
+            <button
+              onClick={onLogout}
+              className="bg-gray-700 hover:bg-gray-600 px-6 py-3 rounded-lg flex items-center gap-2 transition"
+            >
+              <LogOut size={20} />
+              Logout
+            </button>
+          </div>
         </div>
 
         {showForm && (
@@ -522,31 +885,57 @@ export default function App() {
     </div>
   );
 }
+
+export default function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      setIsAuthenticated(true);
+    }
+  }, []);
+
+  const handleLogin = (token) => {
+    setIsAuthenticated(true);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('username');
+    setIsAuthenticated(false);
+  };
+
+  return isAuthenticated ? (
+    <Dashboard onLogout={handleLogout} />
+  ) : (
+    <LoginPage onLogin={handleLogin} />
+  );
+}
 APPEOF
 
-echo "✅ Project structure created"
+echo -e "${GREEN}✅ Project structure created${NC}"
 
-# Step 5: Build Application
-echo "🔨 [5/6] Building application..."
+echo -e "${GREEN}🔨 [5/7] Building application...${NC}"
 
-# Build Frontend
 cd $INSTALL_DIR/frontend
-echo "   Building frontend..."
+echo "   Installing frontend dependencies..."
 npm install --silent
+
+echo "   Building frontend..."
 npm run build
 
-# Build Backend
 cd $INSTALL_DIR/backend
-echo "   Building backend..."
-export PATH=$PATH:/usr/local/go/bin
+echo "   Downloading Go dependencies..."
 go mod tidy
 go mod download
-CGO_ENABLED=1 go build -o $INSTALL_DIR/$APP_NAME main.go
 
-echo "✅ Build completed"
+echo "   Building backend binary..."
+CGO_ENABLED=1 go build -ldflags="-s -w" -o $INSTALL_DIR/$APP_NAME main.go
 
-# Step 6: Create Systemd Service
-echo "⚙️  [6/6] Creating systemd service..."
+echo -e "${GREEN}✅ Build completed${NC}"
+
+echo -e "${GREEN}⚙️  [6/7] Creating systemd service...${NC}"
 
 cat > /etc/systemd/system/$APP_NAME.service << SERVICEEOF
 [Unit]
@@ -562,6 +951,7 @@ Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+Environment="PATH=/usr/local/go/bin:/usr/bin:/bin"
 
 [Install]
 WantedBy=multi-user.target
@@ -571,28 +961,43 @@ systemctl daemon-reload
 systemctl enable $APP_NAME
 systemctl start $APP_NAME
 
-echo "✅ Service created and started"
+echo -e "${GREEN}✅ Service created and started${NC}"
 
-# Final Info
+echo -e "${GREEN}📱 [7/7] Generating initial QR code...${NC}"
+
+sleep 2
+
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
 echo ""
-echo "============================================"
-echo "✅ Installation Complete!"
-echo "============================================"
+echo -e "${GREEN}============================================${NC}"
+echo -e "${GREEN}✅ Installation Complete!${NC}"
+echo -e "${GREEN}============================================${NC}"
 echo ""
-echo "📍 Application Details:"
+echo -e "${YELLOW}📍 Application Details:${NC}"
 echo "   Location: $INSTALL_DIR"
 echo "   Binary: $INSTALL_DIR/$APP_NAME"
 echo "   Database: $INSTALL_DIR/yt-streaming.db"
 echo "   Port: $PORT"
 echo ""
-echo "🌐 Access your dashboard at:"
-echo "   http://$(hostname -I | awk '{print $1}'):$PORT"
+echo -e "${YELLOW}🌐 Access your dashboard at:${NC}"
+echo -e "   ${BLUE}http://$SERVER_IP:$PORT${NC}"
 echo ""
-echo "🔧 Useful Commands:"
+echo -e "${YELLOW}🔐 Default Credentials:${NC}"
+echo "   Username: admin"
+echo "   Password: admin"
+echo ""
+echo -e "${YELLOW}📱 Setup Google Authenticator:${NC}"
+echo "   1. Login with username & password"
+echo "   2. Click 'Show QR Code' button"
+echo "   3. Scan QR with Google Authenticator app"
+echo "   4. Enter 6-digit code to complete login"
+echo ""
+echo -e "${YELLOW}🔧 Useful Commands:${NC}"
 echo "   Status:  systemctl status $APP_NAME"
 echo "   Logs:    journalctl -u $APP_NAME -f"
 echo "   Restart: systemctl restart $APP_NAME"
 echo "   Stop:    systemctl stop $APP_NAME"
 echo ""
-echo "🚀 Your YouTube Streaming Dashboard is now running!"
-echo "============================================"
+echo -e "${GREEN}🚀 Your YouTube Streaming Dashboard is now running!${NC}"
+echo -e "${GREEN}============================================${NC}"
