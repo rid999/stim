@@ -539,8 +539,9 @@ npm run build
 cd $INSTALL_DIR/backend
 echo "   Building backend..."
 export PATH=$PATH:/usr/local/go/bin
+go mod tidy
 go mod download
-go build -o $INSTALL_DIR/$APP_NAME main.go
+CGO_ENABLED=1 go build -o $INSTALL_DIR/$APP_NAME main.go
 
 echo "✅ Build completed"
 
